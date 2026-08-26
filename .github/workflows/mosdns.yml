@@ -1,15 +1,14 @@
-#=================================================
-# https://github.com/wukongdaily/RunFilesBuilder
-# Description: Build RunFiles using GitHub Actions
-# Lisence: MIT
-# Author: wukongdaily
-# Blog: wkdaily.cpolar.cn
-#=================================================
-
-name: Make MosDNS run files
+name: Make MosDNS run files for OpenWrt 24.10
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MOSDNS_REPOSITORY: sbwml/luci-app-mosdns
+  OPENWRT_VERSION: "24.10"
 
 jobs:
   build:
@@ -17,118 +16,183 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-      
-      - name: Fetch latest release tag from mosdns
-        id: fetch_latest_tag
+        uses: actions/checkout@v4
+
+      - name: Fetch latest MosDNS release
+        id: mosdns_release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          latest_tag=$(curl -sk https://api.github.com/repos/sbwml/luci-app-mosdns/releases | grep "tag_name" | grep v5 | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//;s/ //')
-          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
-       
+          set -euo pipefail
 
-      - name: Clone makeself repository
-        run: git clone https://github.com/megastep/makeself.git
+          release_json="$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${MOSDNS_REPOSITORY}/releases/latest")"
 
-      - name: Download latest mosdns files
-        run: |
-          echo "Downloading MosDNS IPK files..."
+          latest_tag="$(jq -er '.tag_name' <<< "${release_json}")"
 
-          # 获取下载链接
-          curl -sk --connect-timeout 10 "https://api.github.com/repos/sbwml/luci-app-mosdns/releases" | grep "browser_download_url" | grep "$latest_tag" > releases.txt
-
-          if [ $? -ne 0 ]; then
-            echo "Failed to get version information, please check the network status."
+          if [[ ! "${latest_tag}" =~ ^v5 ]]; then
+            echo "::error::Unexpected MosDNS release tag: ${latest_tag}"
             exit 1
           fi
 
-          # 创建存放目录
-          mkdir -p mosdns_x86_64 mosdns_aarch64_cortex-a53
+          echo "LATEST_TAG=${latest_tag}" >> "${GITHUB_ENV}"
+          echo "tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+          echo "Latest MosDNS release: ${latest_tag}"
 
-          # 下载文件函数
-          download_file() {
-            local url=$1
-            local output_dir=$2
-            local filename=$(basename "$url")
-            echo "Downloading $filename to $output_dir..."
-            curl --connect-timeout 30 -m 600 -kLo "$output_dir/$filename" "$url"
-            if [ $? -ne 0 ]; then
-              echo "Error! Download $filename failed."
+      - name: Clone makeself repository
+        run: git clone --depth 1 https://github.com/megastep/makeself.git
+
+      - name: Download OpenWrt 24.10 MosDNS packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          download_packages() {
+            local arch="$1"
+            local output_dir="$2"
+            local asset_name="${arch}-openwrt-${OPENWRT_VERSION}.tar.gz"
+            local asset_url="https://github.com/${MOSDNS_REPOSITORY}/releases/download/${LATEST_TAG}/${asset_name}"
+            local archive="${RUNNER_TEMP}/${asset_name}"
+
+            echo "Downloading ${asset_name} from release ${LATEST_TAG}..."
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-all-errors \
+              --connect-timeout 30 \
+              --max-time 600 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -o "${archive}" \
+              "${asset_url}"
+
+            test -s "${archive}"
+            tar -tzf "${archive}" >/dev/null
+
+            mkdir -p "${output_dir}"
+            tar -xzf "${archive}" -C "${output_dir}" --strip-components=1
+
+            if ! find "${output_dir}" -maxdepth 1 -type f -name '*.ipk' -print -quit | grep -q .; then
+              echo "::error::No IPK packages found after extracting ${asset_name}"
               exit 1
             fi
           }
 
-          # 提取下载链接
-          mosdns_x86_64=$(grep "browser_download_url" releases.txt | grep "mosdns_5" | grep "x86_64.ipk" | head -1 | awk -F '"' '{print $4}')
-          mosdns_aarch64_cortex_a53=$(grep "browser_download_url" releases.txt | grep "mosdns_5" | grep "aarch64_cortex-a53.ipk" | head -1 | awk -F '"' '{print $4}')
-          v2dat_x86_64=$(grep "browser_download_url" releases.txt | grep "v2dat_" | grep "x86_64.ipk" | head -1 | awk -F '"' '{print $4}')
-          v2dat_aarch64_cortex_a53=$(grep "browser_download_url" releases.txt | grep "v2dat_" | grep "aarch64_cortex-a53.ipk" | head -1 | awk -F '"' '{print $4}')
-          luci_app=$(grep "browser_download_url" releases.txt | grep "luci-app-mosdns_" | head -1 | awk -F '"' '{print $4}')
-          luci_i18n=$(grep "browser_download_url" releases.txt | grep "luci-i18n-mosdns-zh-cn" | head -1 | awk -F '"' '{print $4}')
-          geoip=$(grep "browser_download_url" releases.txt | grep "v2ray-geoip" | head -1 | awk -F '"' '{print $4}')
-          geosite=$(grep "browser_download_url" releases.txt | grep "v2ray-geosite" | head -1 | awk -F '"' '{print $4}')
+          download_packages "x86_64" "mosdns_x86_64"
+          download_packages "aarch64_cortex-a53" "mosdns_aarch64_cortex-a53"
 
-          # 下载文件到对应目录
-          download_file "$mosdns_x86_64" "mosdns_x86_64"
-          download_file "$mosdns_aarch64_cortex_a53" "mosdns_aarch64_cortex-a53"
-          download_file "$v2dat_x86_64" "mosdns_x86_64"
-          download_file "$v2dat_aarch64_cortex_a53" "mosdns_aarch64_cortex-a53"
-          download_file "$luci_app" "mosdns_x86_64"
-          download_file "$luci_app" "mosdns_aarch64_cortex-a53"
-          download_file "$luci_i18n" "mosdns_x86_64"
-          download_file "$luci_i18n" "mosdns_aarch64_cortex-a53"
-          download_file "$geoip" "mosdns_x86_64"
-          download_file "$geoip" "mosdns_aarch64_cortex-a53"
-          download_file "$geosite" "mosdns_x86_64"
-          download_file "$geosite" "mosdns_aarch64_cortex-a53"
-
-          echo "Download completed."
-
-   
-      - name: Create install.sh scripts
+      - name: Create install scripts
         run: |
-          cat <<EOF > mosdns_x86_64/install.sh
+          set -euo pipefail
+
+          for package_dir in mosdns_x86_64 mosdns_aarch64_cortex-a53; do
+            cat > "${package_dir}/install.sh" <<'INSTALL_SCRIPT'
           #!/bin/sh
-          opkg update
-          if [ $? -ne 0 ]; then
-              echo "update failed。"
-              exit 1
-          fi
-          opkg install *.ipk
-          EOF
-          chmod +x mosdns_x86_64/install.sh
-          cp mosdns_x86_64/install.sh mosdns_aarch64_cortex-a53/install.sh
-          
+          set -eu
 
-      - name: Move mosdns directories to makeself
-        run: |
-          mv mosdns_x86_64 makeself/
-          mv mosdns_aarch64_cortex-a53 makeself/
+          cd "$(dirname "$0")"
+
+          if ! command -v opkg >/dev/null 2>&1; then
+            echo "Error: this package requires OpenWrt 24.10 with opkg."
+            exit 1
+          fi
+
+          if ! ls ./*.ipk >/dev/null 2>&1; then
+            echo "Error: no IPK packages were found."
+            exit 1
+          fi
+
+          opkg update
+
+          # Install local packages in the dependency order used by the upstream installer.
+          for pattern in \
+            './v2dat_*.ipk' \
+            './v2ray-geoip_*.ipk' \
+            './v2ray-geosite_*.ipk' \
+            './mosdns_*.ipk' \
+            './luci-app-mosdns_*.ipk' \
+            './luci-i18n-mosdns-zh-cn_*.ipk'; do
+            for package in $pattern; do
+              [ -f "$package" ] || continue
+              opkg install --force-downgrade "$package"
+            done
+          done
+
+          rm -rf /tmp/luci-*
+
+          if [ -x /etc/init.d/mosdns ]; then
+            /etc/init.d/mosdns restart || true
+          fi
+
+          echo "MosDNS installation completed."
+          INSTALL_SCRIPT
+
+            chmod +x "${package_dir}/install.sh"
+          done
 
       - name: Create self-extracting packages
         run: |
+          set -euo pipefail
+
+          mv mosdns_x86_64 makeself/
+          mv mosdns_aarch64_cortex-a53 makeself/
+
           cd makeself
-          ./makeself.sh mosdns_x86_64/ mosdns_${{ env.LATEST_TAG }}_x86_64.run "by github action" ./install.sh
-          ./makeself.sh mosdns_aarch64_cortex-a53/ mosdns_${{ env.LATEST_TAG }}_aarch64_cortex-a53.run "by github action" ./install.sh
-          
+          ./makeself.sh \
+            mosdns_x86_64/ \
+            "mosdns_${LATEST_TAG}_openwrt-${OPENWRT_VERSION}_x86_64.run" \
+            "MosDNS ${LATEST_TAG} for OpenWrt ${OPENWRT_VERSION} x86_64" \
+            ./install.sh
 
-      - name: Check file sizes
+          ./makeself.sh \
+            mosdns_aarch64_cortex-a53/ \
+            "mosdns_${LATEST_TAG}_openwrt-${OPENWRT_VERSION}_aarch64_cortex-a53.run" \
+            "MosDNS ${LATEST_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_cortex-a53" \
+            ./install.sh
+
+      - name: Verify run files
         run: |
+          set -euo pipefail
           ls -lh makeself/mosdns_*.run
+          test "$(find makeself -maxdepth 1 -type f -name 'mosdns_*.run' | wc -l)" -eq 2
 
-      - name: Fetch latest release details
-        id: fetch_release_details
+      - name: Create release notes
         run: |
-          extra_content="![Github](https://img.shields.io/badge/mosdns.run-123456?logo=github&logoColor=fff&labelColor=yellow&style=for-the-badge) [![Github](https://img.shields.io/badge/国内加速站下载-FC7C0D?logo=github&logoColor=fff&labelColor=000&style=for-the-badge)](https://wkdaily.cpolar.cn/archives/1) ![GitHub Downloads (all assets, specific tag)](https://img.shields.io/github/downloads/wukongdaily/RunFilesBuilder/${{ env.LATEST_TAG }}/total?style=for-the-badge&labelColor=black&color=%2325c2a0)"
-          sed -i "1i$extra_content" "${{ github.workspace }}/common.md"
+          cat > release-notes.md <<EOF
+          MosDNS ${LATEST_TAG} self-extracting installers for OpenWrt ${OPENWRT_VERSION}.
 
-    
+          Included architectures:
+          - x86_64
+          - aarch64_cortex-a53
+
+          Run the matching installer on the OpenWrt device as root.
+          EOF
+
+          if [ -f common.md ]; then
+            printf '\n' >> release-notes.md
+            cat common.md >> release-notes.md
+          fi
+
       - name: Upload run files as release assets
         uses: softprops/action-gh-release@v2.1.0
         with:
           tag_name: ${{ env.LATEST_TAG }}
-          name: "mosdns-${{ env.LATEST_TAG }}"
+          name: mosdns-${{ env.LATEST_TAG }}-openwrt-${{ env.OPENWRT_VERSION }}
           files: makeself/mosdns_*.run
-          body_path: ${{ github.workspace }}/common.md
-          token: ${{ secrets.GITHUB_TOKEN }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          overwrite_files: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
