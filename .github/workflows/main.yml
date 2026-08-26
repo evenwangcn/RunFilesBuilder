@@ -1,160 +1,131 @@
+#=================================================
+# https://github.com/wukongdaily/RunFilesBuilder
+# Description: Build RunFiles using GitHub Actions
+# Lisence: MIT
+# Author: wukongdaily
+# Blog: wkdaily.cpolar.cn
+#=================================================
+
 name: Make Passwall run files
 
 on:
   workflow_dispatch:
-    inputs:
-      openwrt_version:
-        description: OpenWrt version
-        required: true
-        type: choice
-        default: "24.10"
-        options:
-          - "25.12"
-          - "24.10"
-          - "23.05"
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      OPENWRT_VERSION: ${{ inputs.openwrt_version }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Read latest PassWall release
-        shell: bash
+        uses: actions/checkout@v3
+      
+      - name: Fetch latest release tag from Passwall
+        id: fetch_latest_tag
         run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location \
-            https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
-            --output passwall-release.json
-
-          latest_tag="$(jq -er '.tag_name' passwall-release.json)"
-          echo "LATEST_TAG=$latest_tag" >> "$GITHUB_ENV"
+          latest_tag=$(curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest | jq -r '.tag_name')
+          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
 
       - name: Clone makeself repository
-        run: git clone --depth 1 https://github.com/megastep/makeself.git
+        run: git clone https://github.com/megastep/makeself.git
 
-      - name: Download PassWall files
-        shell: bash
+      - name: Download latest Passwall files
         run: |
-          set -euo pipefail
           mkdir -p downloads
+          cd downloads
+          # 下载依赖ipk
+          curl -L -o passwall_packages_ipk_x86_64.zip https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_x86_64.zip
+          curl -L -o passwall_packages_ipk_aarch64_cortex-a53.zip https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_aarch64_cortex-a53.zip
+          # 下载主程序luci
+          curl -LO "$(
+            curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
+            | grep -oP '"browser_download_url":\s*"\K[^"]*23\.05-24\.10_luci-app-passwall_.*_all\.ipk'
+          )"
+          # 下载简体中文语言包
+          curl -L -O "$(
+            curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
+            | jq -r '.assets[]
+              | select(.name | test("^23.05-24.10_luci-i18n-passwall-zh-cn_.*\\.ipk$"))
+              | .browser_download_url'
+          )"
 
-          if [[ "$OPENWRT_VERSION" == "25.12" ]]; then
-            package_prefix='25\.12\+'
-            package_extension='apk'
-          else
-            package_prefix='23\.05-24\.10'
-            package_extension='ipk'
-            curl --fail --show-error --location \
-              --output downloads/passwall_packages_ipk_x86_64.zip \
-              https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_x86_64.zip
-            curl --fail --show-error --location \
-              --output downloads/passwall_packages_ipk_aarch64_cortex-a53.zip \
-              https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_aarch64_cortex-a53.zip
-          fi
-
-          app_url="$(jq -er --arg prefix "$package_prefix" '
-            [.assets[]
-             | select(.name | test("^" + $prefix + "_luci-app-passwall[-_].*\\.(ipk|apk)$"))
-             | .browser_download_url][0]
-          ' passwall-release.json)"
-          i18n_url="$(jq -er --arg prefix "$package_prefix" '
-            [.assets[]
-             | select(.name | test("^" + $prefix + "_luci-i18n-passwall-zh-cn[-_].*\\.(ipk|apk)$"))
-             | .browser_download_url][0]
-          ' passwall-release.json)"
-
-          curl --fail --show-error --location --remote-name \
-            --output-dir downloads "$app_url"
-          curl --fail --show-error --location --remote-name \
-            --output-dir downloads "$i18n_url"
-
-          test "$(find downloads -maxdepth 1 -name "*.${package_extension}" | wc -l)" -eq 2
-
-      - name: Organize package files
-        shell: bash
+      - name: Organize files for x86_64
         run: |
-          set -euo pipefail
           mkdir -p passwall_x86_64/depends passwall_x86_64/main
-          mkdir -p passwall_aarch64/depends passwall_aarch64/main
-
-          if [[ "$OPENWRT_VERSION" == "25.12" ]]; then
-            cp downloads/*.apk passwall_x86_64/main/
-            cp downloads/*.apk passwall_aarch64/main/
-          else
-            unzip -q downloads/passwall_packages_ipk_x86_64.zip \
-              -d passwall_x86_64/depends
-            unzip -q downloads/passwall_packages_ipk_aarch64_cortex-a53.zip \
-              -d passwall_aarch64/depends
-            cp downloads/*.ipk passwall_x86_64/main/
-            cp downloads/*.ipk passwall_aarch64/main/
-          fi
-
-      - name: Create install scripts
-        shell: bash
+          unzip downloads/passwall_packages_ipk_x86_64.zip -d passwall_x86_64/depends
+          rm downloads/passwall_packages_ipk_x86_64.zip
+          cp downloads/23*.ipk passwall_x86_64/main/
+      - name: Organize files for aarch64_cortex-a53
         run: |
-          set -euo pipefail
-          cat <<'EOF' > passwall_x86_64/install.sh
-          #!/bin/sh
-          set -e
+          mkdir -p passwall_aarch64/depends passwall_aarch64/main
+          unzip downloads/passwall_packages_ipk_aarch64_cortex-a53.zip -d passwall_aarch64/depends
+          rm downloads/passwall_packages_ipk_aarch64_cortex-a53.zip
+          cp downloads/23*.ipk passwall_aarch64/main/
 
-          cd "$(dirname "$0")"
-          if command -v apk >/dev/null 2>&1; then
-              apk update
-              apk add --allow-untrusted main/*.apk
-          else
-              opkg update
-              opkg install \
-                iptables-mod-tproxy \
-                iptables-mod-socket \
-                iptables-mod-iprange \
-                iptables-mod-conntrack-extra
-              opkg install depends/*.ipk
-              opkg install main/*.ipk
+      - name: Create install.sh scripts
+        run: |
+          cat <<EOF > passwall_x86_64/install.sh
+          #!/bin/sh
+          opkg update
+          if [ $? -ne 0 ]; then
+              echo "update failed。"
+              exit 1
           fi
+          opkg install iptables-mod-tproxy
+          opkg install iptables-mod-socket
+          opkg install iptables-mod-iprange
+          opkg install iptables-mod-conntrack-extra
+          opkg install depends/*.ipk
+          opkg install main/*.ipk
           EOF
           chmod +x passwall_x86_64/install.sh
           cp passwall_x86_64/install.sh passwall_aarch64/install.sh
 
+      - name: Move passwall directories to makeself
+        run: |
+          mv passwall_x86_64 makeself/
+          mv passwall_aarch64 makeself/
+
       - name: Create self-extracting packages
-        shell: bash
         run: |
-          set -euo pipefail
-          mv passwall_x86_64 passwall_aarch64 makeself/
           cd makeself
-          ./makeself.sh passwall_x86_64/ \
-            "passwall_x86_64_openwrt-${OPENWRT_VERSION}_${LATEST_TAG}.run" \
-            "PassWall for OpenWrt ${OPENWRT_VERSION}" ./install.sh
-          ./makeself.sh passwall_aarch64/ \
-            "passwall_aarch64_a53_openwrt-${OPENWRT_VERSION}_${LATEST_TAG}.run" \
-            "PassWall for OpenWrt ${OPENWRT_VERSION}" ./install.sh
-          ls -lh passwall_*.run
+          ./makeself.sh passwall_x86_64/ passwall_x86_64_${{ env.LATEST_TAG }}.run "by github action" ./install.sh
+          ./makeself.sh passwall_aarch64/ passwall_aarch64_a53_${{ env.LATEST_TAG }}.run "by github action" ./install.sh
 
-      - name: Create release notes
-        shell: bash
+      - name: Check file sizes
         run: |
-          set -euo pipefail
-          cat > release_notes.md <<EOF
-          PassWall ${LATEST_TAG}
+          ls -lh makeself/passwall_*.run
 
-          OpenWrt version selected for this build: ${OPENWRT_VERSION}
-          EOF
+      - name: Preparing release name
+        run: |
+          release_name=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M Build')
+          echo "RELEASE_NAME=$release_name" >> $GITHUB_ENV
 
-      - name: Create or update release and upload run files
-        uses: softprops/action-gh-release@v2
+      - name: Fetch latest release details
+        id: fetch_release_details
+        run: |
+          extra_content="![Github](https://img.shields.io/badge/Passwall.run-123456?logo=github&logoColor=fff&labelColor=green&style=for-the-badge) [![Github](https://img.shields.io/badge/国内加速站下载-FC7C0D?logo=github&logoColor=fff&labelColor=000&style=for-the-badge)](https://wkdaily.cpolar.cn/archives/1) ![GitHub Downloads (all assets, specific tag)](https://img.shields.io/github/downloads/wukongdaily/RunFilesBuilder/${{ env.LATEST_TAG }}/total?style=for-the-badge&labelColor=black&color=%2325c2a0)"
+          echo -e "$extra_content" > release_notes.md
+
+      - name: Print release notes
+        run: |
+          cat release_notes.md
+
+      - name: Generate new tag & release
+        uses: softprops/action-gh-release@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.LATEST_TAG }}
-          name: PassWall-${{ env.LATEST_TAG }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ github.ref_name }}
           prerelease: false
           body_path: release_notes.md
+
+      - name: Upload run files as release assets
+        uses: softprops/action-gh-release@v2.1.0
+        with:
+          tag_name: ${{ env.LATEST_TAG }}
+          name: "PassWall-${{ env.LATEST_TAG }}"
           files: makeself/passwall_*.run
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
