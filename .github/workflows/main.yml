@@ -1,131 +1,283 @@
-#=================================================
-# https://github.com/wukongdaily/RunFilesBuilder
-# Description: Build RunFiles using GitHub Actions
-# Lisence: MIT
-# Author: wukongdaily
-# Blog: wkdaily.cpolar.cn
-#=================================================
-
-name: Make Passwall run files
+name: Make PassWall run files
 
 on:
   workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: OpenWrt version
+        required: true
+        type: choice
+        default: "24.10"
+        options:
+          - "24.10"
+          - "25.12"
+
+permissions:
+  contents: write
+
+env:
+  PASSWALL_REPOSITORY: Openwrt-Passwall/openwrt-passwall
+  OPENWRT_VERSION: ${{ inputs.openwrt_version }}
+  PASSWALL_FEED_ROOT: https://master.dl.sourceforge.net/project/openwrt-passwall-build
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-      
-      - name: Fetch latest release tag from Passwall
-        id: fetch_latest_tag
+        uses: actions/checkout@v4
+
+      - name: Fetch latest PassWall release
+        id: passwall_release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          latest_tag=$(curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest | jq -r '.tag_name')
-          echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PASSWALL_REPOSITORY}/releases/latest" \
+            -o "${RUNNER_TEMP}/passwall-release.json"
+
+          latest_tag="$(jq -er '.tag_name' "${RUNNER_TEMP}/passwall-release.json")"
+          safe_tag="$(printf '%s' "${latest_tag}" | tr -c 'A-Za-z0-9._+-' '_')"
+
+          [ -n "${latest_tag}" ] || {
+            echo "::error::The latest PassWall release tag is empty"
+            exit 1
+          }
+
+          echo "PASSWALL_TAG=${latest_tag}" >> "${GITHUB_ENV}"
+          echo "PASSWALL_SAFE_TAG=${safe_tag}" >> "${GITHUB_ENV}"
+          echo "Latest PassWall release: ${latest_tag}"
+
+      - name: Select and download LuCI packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          case "${OPENWRT_VERSION}" in
+            24.10) package_extension="ipk" ;;
+            25.12) package_extension="apk" ;;
+            *)
+              echo "::error::Unsupported OpenWrt version: ${OPENWRT_VERSION}"
+              exit 1
+              ;;
+          esac
+
+          release_json="${RUNNER_TEMP}/passwall-release.json"
+
+          select_asset() {
+            local package_name="$1"
+            jq -er \
+              --arg package_name "${package_name}" \
+              --arg extension "${package_extension}" \
+              '[.assets[]
+                | select(.name | test("(^|_)" + $package_name + "[_-].*\\." + $extension + "$"))]
+               | if length == 1 then .[0]
+                 else error("expected exactly one " + $package_name + "." + $extension + " asset, found " + (length | tostring))
+                 end' \
+              "${release_json}"
+          }
+
+          download_asset() {
+            local package_name="$1"
+            local asset_json
+            local asset_name
+            local asset_url
+
+            asset_json="$(select_asset "${package_name}")"
+            asset_name="$(jq -er '.name' <<< "${asset_json}")"
+            asset_url="$(jq -er '.url' <<< "${asset_json}")"
+
+            echo "Downloading ${asset_name}..."
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-all-errors \
+              --connect-timeout 30 \
+              --max-time 600 \
+              -H "Accept: application/octet-stream" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -o "downloads/${asset_name}" \
+              "${asset_url}"
+
+            test -s "downloads/${asset_name}"
+          }
+
+          mkdir -p downloads
+          download_asset "luci-app-passwall"
+          download_asset "luci-i18n-passwall-zh-cn"
+
+          echo "PACKAGE_EXTENSION=${package_extension}" >> "${GITHUB_ENV}"
+          ls -lh downloads/
 
       - name: Clone makeself repository
-        run: git clone https://github.com/megastep/makeself.git
+        run: git clone --depth 1 https://github.com/megastep/makeself.git
 
-      - name: Download latest Passwall files
+      - name: Prepare architecture packages
         run: |
-          mkdir -p downloads
-          cd downloads
-          # 下载依赖ipk
-          curl -L -o passwall_packages_ipk_x86_64.zip https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_x86_64.zip
-          curl -L -o passwall_packages_ipk_aarch64_cortex-a53.zip https://github.com/wkccd/storage/releases/download/pw/passwall_packages_ipk_aarch64_cortex-a53.zip
-          # 下载主程序luci
-          curl -LO "$(
-            curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
-            | grep -oP '"browser_download_url":\s*"\K[^"]*23\.05-24\.10_luci-app-passwall_.*_all\.ipk'
-          )"
-          # 下载简体中文语言包
-          curl -L -O "$(
-            curl -s https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall/releases/latest \
-            | jq -r '.assets[]
-              | select(.name | test("^23.05-24.10_luci-i18n-passwall-zh-cn_.*\\.ipk$"))
-              | .browser_download_url'
-          )"
+          set -euo pipefail
 
-      - name: Organize files for x86_64
-        run: |
-          mkdir -p passwall_x86_64/depends passwall_x86_64/main
-          unzip downloads/passwall_packages_ipk_x86_64.zip -d passwall_x86_64/depends
-          rm downloads/passwall_packages_ipk_x86_64.zip
-          cp downloads/23*.ipk passwall_x86_64/main/
-      - name: Organize files for aarch64_cortex-a53
-        run: |
-          mkdir -p passwall_aarch64/depends passwall_aarch64/main
-          unzip downloads/passwall_packages_ipk_aarch64_cortex-a53.zip -d passwall_aarch64/depends
-          rm downloads/passwall_packages_ipk_aarch64_cortex-a53.zip
-          cp downloads/23*.ipk passwall_aarch64/main/
+          for package_dir in passwall_x86_64 passwall_aarch64_cortex-a53; do
+            mkdir -p "${package_dir}/main"
+            cp downloads/*."${PACKAGE_EXTENSION}" "${package_dir}/main/"
+          done
 
-      - name: Create install.sh scripts
+      - name: Create install scripts
         run: |
-          cat <<EOF > passwall_x86_64/install.sh
+          set -euo pipefail
+
+          create_install_script() {
+            local package_dir="$1"
+            local expected_arch="$2"
+
+            cat > "${package_dir}/install.sh" <<'INSTALL_SCRIPT'
           #!/bin/sh
-          opkg update
-          if [ $? -ne 0 ]; then
-              echo "update failed。"
-              exit 1
-          fi
-          opkg install iptables-mod-tproxy
-          opkg install iptables-mod-socket
-          opkg install iptables-mod-iprange
-          opkg install iptables-mod-conntrack-extra
-          opkg install depends/*.ipk
-          opkg install main/*.ipk
-          EOF
-          chmod +x passwall_x86_64/install.sh
-          cp passwall_x86_64/install.sh passwall_aarch64/install.sh
+          set -eu
 
-      - name: Move passwall directories to makeself
-        run: |
-          mv passwall_x86_64 makeself/
-          mv passwall_aarch64 makeself/
+          expected_arch="__EXPECTED_ARCH__"
+          expected_release="__EXPECTED_RELEASE__"
+          feed_root="https://master.dl.sourceforge.net/project/openwrt-passwall-build"
+
+          error() {
+            echo "Error: $*" >&2
+            exit 1
+          }
+
+          [ -f /etc/openwrt_release ] || error "this installer must run on OpenWrt"
+          . /etc/openwrt_release
+
+          case "${DISTRIB_RELEASE:-}" in
+            "$expected_release"|"$expected_release".*) ;;
+            *) error "OpenWrt $expected_release is required; detected ${DISTRIB_RELEASE:-unknown}" ;;
+          esac
+
+          [ "${DISTRIB_ARCH:-unknown}" = "$expected_arch" ] || \
+            error "architecture mismatch: package=$expected_arch, device=${DISTRIB_ARCH:-unknown}"
+
+          cd "$(dirname "$0")"
+
+          if [ "$expected_release" = "24.10" ]; then
+            command -v opkg >/dev/null 2>&1 || error "opkg was not found"
+            find main -type f -name '*.ipk' -print -quit | grep -q . || error "IPK packages are missing"
+
+            key_file="/tmp/openwrt-passwall-build-ipk.pub"
+            wget -qO "$key_file" "$feed_root/ipk.pub" || error "failed to download the PassWall feed key"
+            opkg-key add "$key_file" || error "failed to import the PassWall feed key"
+
+            feed_file="/etc/opkg/customfeeds.conf"
+            touch "$feed_file"
+            sed -i '/^src\/gz passwall_\(luci\|packages\|passwall2\) /d' "$feed_file"
+            echo "src/gz passwall_luci $feed_root/releases/packages-24.10/$expected_arch/passwall_luci" >> "$feed_file"
+            echo "src/gz passwall_packages $feed_root/releases/packages-24.10/$expected_arch/passwall_packages" >> "$feed_file"
+
+            opkg update
+            opkg install --force-downgrade main/luci-app-passwall_*.ipk
+            opkg install --force-downgrade main/luci-i18n-passwall-zh-cn_*.ipk
+          else
+            command -v apk >/dev/null 2>&1 || error "apk was not found"
+            find main -type f -name '*.apk' -print -quit | grep -q . || error "APK packages are missing"
+
+            mkdir -p /etc/apk/keys /etc/apk/repositories.d
+            wget -qO /etc/apk/keys/openwrt-passwall-build.pem "$feed_root/apk.pub" || \
+              error "failed to download the PassWall feed key"
+
+            repository_file="/etc/apk/repositories.d/passwall.list"
+            : > "$repository_file"
+            echo "$feed_root/releases/packages-25.12/$expected_arch/passwall_luci/packages.adb" >> "$repository_file"
+            echo "$feed_root/releases/packages-25.12/$expected_arch/passwall_packages/packages.adb" >> "$repository_file"
+
+            apk update
+            apk add --allow-untrusted main/luci-app-passwall*.apk
+            apk add --allow-untrusted main/luci-i18n-passwall-zh-cn*.apk
+          fi
+
+          rm -rf /tmp/luci-*
+
+          if [ -x /etc/init.d/passwall ]; then
+            /etc/init.d/passwall restart || true
+          fi
+
+          echo "PassWall installation completed."
+          INSTALL_SCRIPT
+
+            sed -i \
+              -e "s/__EXPECTED_ARCH__/${expected_arch}/" \
+              -e "s/__EXPECTED_RELEASE__/${OPENWRT_VERSION}/" \
+              "${package_dir}/install.sh"
+            chmod +x "${package_dir}/install.sh"
+          }
+
+          create_install_script "passwall_x86_64" "x86_64"
+          create_install_script "passwall_aarch64_cortex-a53" "aarch64_cortex-a53"
 
       - name: Create self-extracting packages
         run: |
+          set -euo pipefail
+
+          mv passwall_x86_64 makeself/
+          mv passwall_aarch64_cortex-a53 makeself/
+
           cd makeself
-          ./makeself.sh passwall_x86_64/ passwall_x86_64_${{ env.LATEST_TAG }}.run "by github action" ./install.sh
-          ./makeself.sh passwall_aarch64/ passwall_aarch64_a53_${{ env.LATEST_TAG }}.run "by github action" ./install.sh
+          ./makeself.sh \
+            passwall_x86_64/ \
+            "passwall_${PASSWALL_SAFE_TAG}_openwrt-${OPENWRT_VERSION}_x86_64.run" \
+            "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} x86_64" \
+            ./install.sh
 
-      - name: Check file sizes
+          ./makeself.sh \
+            passwall_aarch64_cortex-a53/ \
+            "passwall_${PASSWALL_SAFE_TAG}_openwrt-${OPENWRT_VERSION}_aarch64_cortex-a53.run" \
+            "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_cortex-a53" \
+            ./install.sh
+
+      - name: Verify run files
         run: |
+          set -euo pipefail
           ls -lh makeself/passwall_*.run
+          test "$(find makeself -maxdepth 1 -type f -name 'passwall_*.run' | wc -l)" -eq 2
 
-      - name: Preparing release name
+      - name: Create release notes
         run: |
-          release_name=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M Build')
-          echo "RELEASE_NAME=$release_name" >> $GITHUB_ENV
+          cat > release-notes.md <<EOF
+          PassWall ${PASSWALL_TAG} installers for OpenWrt ${OPENWRT_VERSION}.
 
-      - name: Fetch latest release details
-        id: fetch_release_details
-        run: |
-          extra_content="![Github](https://img.shields.io/badge/Passwall.run-123456?logo=github&logoColor=fff&labelColor=green&style=for-the-badge) [![Github](https://img.shields.io/badge/国内加速站下载-FC7C0D?logo=github&logoColor=fff&labelColor=000&style=for-the-badge)](https://wkdaily.cpolar.cn/archives/1) ![GitHub Downloads (all assets, specific tag)](https://img.shields.io/github/downloads/wukongdaily/RunFilesBuilder/${{ env.LATEST_TAG }}/total?style=for-the-badge&labelColor=black&color=%2325c2a0)"
-          echo -e "$extra_content" > release_notes.md
+          Architectures:
+          - x86_64
+          - aarch64_cortex-a53
 
-      - name: Print release notes
-        run: |
-          cat release_notes.md
+          The installer adds the matching openwrt-passwall-build package feed so that dependencies are resolved by opkg or apk.
+          An internet connection is required during installation.
+          EOF
 
-      - name: Generate new tag & release
-        uses: softprops/action-gh-release@master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.LATEST_TAG }}
-          target_commitish: ${{ github.ref_name }}
-          prerelease: false
-          body_path: release_notes.md
+          if [ -f common.md ]; then
+            printf '\n' >> release-notes.md
+            cat common.md >> release-notes.md
+          fi
 
-      - name: Upload run files as release assets
+      - name: Publish release
         uses: softprops/action-gh-release@v2.1.0
         with:
-          tag_name: ${{ env.LATEST_TAG }}
-          name: "PassWall-${{ env.LATEST_TAG }}"
+          tag_name: passwall-${{ env.PASSWALL_SAFE_TAG }}-openwrt-${{ env.OPENWRT_VERSION }}
+          name: PassWall ${{ env.PASSWALL_TAG }} for OpenWrt ${{ env.OPENWRT_VERSION }}
+          body_path: release-notes.md
           files: makeself/passwall_*.run
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
