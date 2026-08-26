@@ -68,8 +68,14 @@ jobs:
           set -euo pipefail
 
           case "${OPENWRT_VERSION}" in
-            24.10) package_extension="ipk" ;;
-            25.12) package_extension="apk" ;;
+            24.10)
+              package_extension="ipk"
+              asset_prefix="23.05-24.10_"
+              ;;
+            25.12)
+              package_extension="apk"
+              asset_prefix="25.12+_"
+              ;;
             *)
               echo "::error::Unsupported OpenWrt version: ${OPENWRT_VERSION}"
               exit 1
@@ -83,7 +89,9 @@ jobs:
             jq -er \
               --arg package_name "${package_name}" \
               --arg extension "${package_extension}" \
+              --arg prefix "${asset_prefix}" \
               '[.assets[]
+                | select(.name | startswith($prefix))
                 | select(.name | test("(^|_)" + $package_name + "[_-].*\\." + $extension + "$"))]
                | if length == 1 then .[0]
                  else error("expected exactly one " + $package_name + "." + $extension + " asset, found " + (length | tostring))
@@ -120,8 +128,13 @@ jobs:
           }
 
           mkdir -p downloads
-          download_asset "luci-app-passwall"
-          download_asset "luci-i18n-passwall-zh-cn"
+          if ! download_asset "luci-app-passwall" || \
+             ! download_asset "luci-i18n-passwall-zh-cn"; then
+            echo "::error::No unique PassWall assets matched prefix '${asset_prefix}' and extension '.${package_extension}'."
+            echo "Available release assets:"
+            jq -r '.assets[].name' "${release_json}"
+            exit 1
+          fi
 
           echo "PACKAGE_EXTENSION=${package_extension}" >> "${GITHUB_ENV}"
           ls -lh downloads/
