@@ -23,7 +23,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -139,6 +139,72 @@ jobs:
           echo "PACKAGE_EXTENSION=${package_extension}" >> "${GITHUB_ENV}"
           ls -lh downloads/
 
+      - name: Download complete offline dependency bundles
+        run: |
+          set -euo pipefail
+
+          download_dependencies() {
+            local arch="$1"
+            local output_dir="$2"
+            local sourceforge_url="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${arch}/passwall_packages/"
+            local page_file="${RUNNER_TEMP}/${arch}-passwall-packages.html"
+            local links_file="${RUNNER_TEMP}/${arch}-passwall-packages-links.txt"
+            local link
+            local filename
+
+            mkdir -p "${output_dir}/depends"
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 4 \
+              --retry-all-errors \
+              --connect-timeout 30 \
+              --max-time 300 \
+              -o "${page_file}" \
+              "${sourceforge_url}"
+
+            grep -oE 'href="https://sourceforge\.net/projects/openwrt-passwall-build/files/[^\"]+\.'"${PACKAGE_EXTENSION}"'/download"' \
+              "${page_file}" \
+              | sed -e 's/^href="//' -e 's/"$//' \
+              | sort -u > "${links_file}"
+
+            if [ ! -s "${links_file}" ]; then
+              echo "::error::No .${PACKAGE_EXTENSION} dependencies found for ${OPENWRT_VERSION}/${arch}"
+              exit 1
+            fi
+
+            while IFS= read -r link; do
+              filename="$(basename "${link%/download}")"
+              echo "Downloading ${arch}/${filename}..."
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --location \
+                --retry 4 \
+                --retry-all-errors \
+                --connect-timeout 30 \
+                --max-time 1200 \
+                -o "${output_dir}/depends/${filename}" \
+                "${link}"
+              test -s "${output_dir}/depends/${filename}"
+            done < "${links_file}"
+
+            package_count="$(find "${output_dir}/depends" -maxdepth 1 -type f -name "*.${PACKAGE_EXTENSION}" | wc -l)"
+            echo "Downloaded ${package_count} offline dependency packages for ${arch}."
+
+            if [ "${package_count}" -lt 10 ]; then
+              echo "::error::Dependency bundle for ${arch} is unexpectedly incomplete"
+              exit 1
+            fi
+          }
+
+          download_dependencies "x86_64" "passwall_x86_64"
+          download_dependencies "aarch64_cortex-a53" "passwall_aarch64_cortex-a53"
+
       - name: Clone makeself repository
         run: git clone --depth 1 https://github.com/megastep/makeself.git
 
@@ -149,6 +215,8 @@ jobs:
           for package_dir in passwall_x86_64 passwall_aarch64_cortex-a53; do
             mkdir -p "${package_dir}/main"
             cp downloads/*."${PACKAGE_EXTENSION}" "${package_dir}/main/"
+            echo "${OPENWRT_VERSION}" > "${package_dir}/openwrt-version"
+            echo "${PASSWALL_TAG}" > "${package_dir}/passwall-version"
           done
 
       - name: Create install scripts
@@ -165,7 +233,6 @@ jobs:
 
           expected_arch="__EXPECTED_ARCH__"
           expected_release="__EXPECTED_RELEASE__"
-          feed_root="https://master.dl.sourceforge.net/project/openwrt-passwall-build"
 
           error() {
             echo "Error: $*" >&2
@@ -185,39 +252,25 @@ jobs:
 
           cd "$(dirname "$0")"
 
+          available_mb="$(df -Pm /usr | awk 'END { print $4 }')"
+          [ "${available_mb:-0}" -ge 350 ] || \
+            error "at least 350 MB of free space on /usr is required for the complete offline bundle"
+
           if [ "$expected_release" = "24.10" ]; then
             command -v opkg >/dev/null 2>&1 || error "opkg was not found"
             find main -type f -name '*.ipk' -print -quit | grep -q . || error "IPK packages are missing"
+            find depends -type f -name '*.ipk' -print -quit | grep -q . || error "offline IPK dependencies are missing"
 
-            key_file="/tmp/openwrt-passwall-build-ipk.pub"
-            wget -qO "$key_file" "$feed_root/ipk.pub" || error "failed to download the PassWall feed key"
-            opkg-key add "$key_file" || error "failed to import the PassWall feed key"
-
-            feed_file="/etc/opkg/customfeeds.conf"
-            touch "$feed_file"
-            sed -i '/^src\/gz passwall_\(luci\|packages\|passwall2\) /d' "$feed_file"
-            echo "src/gz passwall_luci $feed_root/releases/packages-24.10/$expected_arch/passwall_luci" >> "$feed_file"
-            echo "src/gz passwall_packages $feed_root/releases/packages-24.10/$expected_arch/passwall_packages" >> "$feed_file"
-
-            opkg update
-            opkg install --force-downgrade main/luci-app-passwall_*.ipk
-            opkg install --force-downgrade main/luci-i18n-passwall-zh-cn_*.ipk
+            # Every PassWall user-space package is local; no PassWall feed is contacted here.
+            opkg install --force-downgrade depends/*.ipk
+            opkg install --force-downgrade main/*.ipk
           else
             command -v apk >/dev/null 2>&1 || error "apk was not found"
             find main -type f -name '*.apk' -print -quit | grep -q . || error "APK packages are missing"
+            find depends -type f -name '*.apk' -print -quit | grep -q . || error "offline APK dependencies are missing"
 
-            mkdir -p /etc/apk/keys /etc/apk/repositories.d
-            wget -qO /etc/apk/keys/openwrt-passwall-build.pem "$feed_root/apk.pub" || \
-              error "failed to download the PassWall feed key"
-
-            repository_file="/etc/apk/repositories.d/passwall.list"
-            : > "$repository_file"
-            echo "$feed_root/releases/packages-25.12/$expected_arch/passwall_luci/packages.adb" >> "$repository_file"
-            echo "$feed_root/releases/packages-25.12/$expected_arch/passwall_packages/packages.adb" >> "$repository_file"
-
-            apk update
-            apk add --allow-untrusted main/luci-app-passwall*.apk
-            apk add --allow-untrusted main/luci-i18n-passwall-zh-cn*.apk
+            # Every PassWall user-space package is local; no PassWall feed is contacted here.
+            apk add --allow-untrusted depends/*.apk main/*.apk
           fi
 
           rm -rf /tmp/luci-*
@@ -274,8 +327,9 @@ jobs:
           - x86_64
           - aarch64_cortex-a53
 
-          The installer adds the matching openwrt-passwall-build package feed so that dependencies are resolved by opkg or apk.
-          An internet connection is required during installation.
+          The run files include the complete matching passwall_packages dependency feed and do not download PassWall components during installation.
+
+          Note: firmware-specific kernel modules cannot be made universal across every OpenWrt build. The target firmware must already provide any required kernel modules and base-system libraries.
           EOF
 
           if [ -f common.md ]; then
