@@ -204,6 +204,7 @@ jobs:
 
           download_dependencies "x86_64" "passwall_x86_64"
           download_dependencies "aarch64_cortex-a53" "passwall_aarch64_cortex-a53"
+          download_dependencies "aarch64_generic" "passwall_aarch64_generic"
 
       - name: Clone makeself repository
         run: git clone --depth 1 https://github.com/megastep/makeself.git
@@ -212,7 +213,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          for package_dir in passwall_x86_64 passwall_aarch64_cortex-a53; do
+          for package_dir in \
+            passwall_x86_64 \
+            passwall_aarch64_cortex-a53 \
+            passwall_aarch64_generic; do
             mkdir -p "${package_dir}/main"
             cp downloads/*."${PACKAGE_EXTENSION}" "${package_dir}/main/"
             echo "${OPENWRT_VERSION}" > "${package_dir}/openwrt-version"
@@ -291,6 +295,7 @@ jobs:
 
           create_install_script "passwall_x86_64" "x86_64"
           create_install_script "passwall_aarch64_cortex-a53" "aarch64_cortex-a53"
+          create_install_script "passwall_aarch64_generic" "aarch64_generic"
 
       - name: Create self-extracting packages
         run: |
@@ -298,6 +303,7 @@ jobs:
 
           mv passwall_x86_64 makeself/
           mv passwall_aarch64_cortex-a53 makeself/
+          mv passwall_aarch64_generic makeself/
 
           cd makeself
           ./makeself.sh \
@@ -312,11 +318,17 @@ jobs:
             "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_cortex-a53" \
             ./install.sh
 
+          ./makeself.sh \
+            passwall_aarch64_generic/ \
+            "passwall_${PASSWALL_SAFE_TAG}_openwrt-${OPENWRT_VERSION}_aarch64_generic.run" \
+            "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_generic" \
+            ./install.sh
+
       - name: Verify run files
         run: |
           set -euo pipefail
           ls -lh makeself/passwall_*.run
-          test "$(find makeself -maxdepth 1 -type f -name 'passwall_*.run' | wc -l)" -eq 2
+          test "$(find makeself -maxdepth 1 -type f -name 'passwall_*.run' | wc -l)" -eq 3
 
       - name: Create release notes
         run: |
@@ -326,6 +338,7 @@ jobs:
           Architectures:
           - x86_64
           - aarch64_cortex-a53
+          - aarch64_generic
 
           The run files include the complete matching passwall_packages dependency feed and do not download PassWall components during installation.
 
