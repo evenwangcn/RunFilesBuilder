@@ -1,14 +1,23 @@
-name: Make MosDNS run files for OpenWrt 24.10
+name: Make MosDNS run files
 
 on:
   workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: OpenWrt version
+        required: true
+        type: choice
+        default: "24.10"
+        options:
+          - "24.10"
+          - "25.12"
 
 permissions:
   contents: write
 
 env:
   MOSDNS_REPOSITORY: sbwml/luci-app-mosdns
-  OPENWRT_VERSION: "24.10"
+  OPENWRT_VERSION: ${{ inputs.openwrt_version }}
 
 jobs:
   build:
@@ -51,7 +60,7 @@ jobs:
       - name: Clone makeself repository
         run: git clone --depth 1 https://github.com/megastep/makeself.git
 
-      - name: Download OpenWrt 24.10 MosDNS packages
+      - name: Download selected OpenWrt MosDNS packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -84,8 +93,8 @@ jobs:
             mkdir -p "${output_dir}"
             tar -xzf "${archive}" -C "${output_dir}" --strip-components=1
 
-            if ! find "${output_dir}" -maxdepth 1 -type f -name '*.ipk' -print -quit | grep -q .; then
-              echo "::error::No IPK packages found after extracting ${asset_name}"
+            if ! find "${output_dir}" -maxdepth 1 -type f \( -name '*.ipk' -o -name '*.apk' \) -print -quit | grep -q .; then
+              echo "::error::No IPK or APK packages found after extracting ${asset_name}"
               exit 1
             fi
           }
@@ -104,29 +113,39 @@ jobs:
 
           cd "$(dirname "$0")"
 
-          if ! command -v opkg >/dev/null 2>&1; then
-            echo "Error: this package requires OpenWrt 24.10 with opkg."
+          if command -v apk >/dev/null 2>&1; then
+            package_manager="apk"
+            package_extension="apk"
+          elif command -v opkg >/dev/null 2>&1; then
+            package_manager="opkg"
+            package_extension="ipk"
+          else
+            echo "Error: neither apk nor opkg was found."
             exit 1
           fi
 
-          if ! ls ./*.ipk >/dev/null 2>&1; then
-            echo "Error: no IPK packages were found."
+          if ! ls ./*."$package_extension" >/dev/null 2>&1; then
+            echo "Error: no .$package_extension packages were found."
             exit 1
           fi
 
-          opkg update
+          "$package_manager" update
 
           # Install local packages in the dependency order used by the upstream installer.
           for pattern in \
-            './v2dat_*.ipk' \
-            './v2ray-geoip_*.ipk' \
-            './v2ray-geosite_*.ipk' \
-            './mosdns_*.ipk' \
-            './luci-app-mosdns_*.ipk' \
-            './luci-i18n-mosdns-zh-cn_*.ipk'; do
+            "./v2dat*.$package_extension" \
+            "./v2ray-geoip*.$package_extension" \
+            "./v2ray-geosite*.$package_extension" \
+            "./mosdns*.$package_extension" \
+            "./luci-app-mosdns*.$package_extension" \
+            "./luci-i18n-mosdns-zh-cn*.$package_extension"; do
             for package in $pattern; do
               [ -f "$package" ] || continue
-              opkg install --force-downgrade "$package"
+              if [ "$package_manager" = "apk" ]; then
+                apk add --allow-untrusted "$package"
+              else
+                opkg install --force-downgrade "$package"
+              fi
             done
           done
 
