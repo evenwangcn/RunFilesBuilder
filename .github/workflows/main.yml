@@ -84,6 +84,9 @@ jobs:
                   ((.name | startswith("luci-i18n-")) | not)
                   or (.name | test("^luci-i18n-passwall-zh-cn([_-])"))
                 )
+              # sing-box and sing-box-tiny provide the same executable and
+              # cannot be installed together. Keep the full sing-box build.
+              | select(.name | test("^sing-box-tiny([_-])") | not)
               | [.name, .browser_download_url] | @tsv
             ' <<< "$release_json" |
             while IFS="$(printf '\t')" read -r asset_name asset_url; do
@@ -119,8 +122,28 @@ jobs:
           else
             cat <<'EOF' > passwall_x86_64/install.sh
           #!/bin/sh
-          set -e
+          set -eu
+
           opkg update
+
+          # Defensive cleanup in case an upstream release contains both
+          # mutually exclusive sing-box package variants.
+          rm -f packages/sing-box-tiny_*.ipk packages/sing-box-tiny-*.ipk
+
+          # Recent mihomo packages manage /usr/bin/mihomo with opkg
+          # alternatives. Preserve an existing regular file before the
+          # package creates its symlink.
+          if [ -e /usr/bin/mihomo ] && [ ! -L /usr/bin/mihomo ]; then
+            backup=/usr/bin/mihomo.pre-passwall
+            index=0
+            while [ -e "$backup" ]; do
+              index=$((index + 1))
+              backup="/usr/bin/mihomo.pre-passwall.$index"
+            done
+            mv /usr/bin/mihomo "$backup"
+            echo "Existing mihomo executable backed up to $backup"
+          fi
+
           opkg install packages/*.ipk
           EOF
           fi
