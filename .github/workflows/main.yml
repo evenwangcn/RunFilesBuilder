@@ -84,9 +84,9 @@ jobs:
                   ((.name | startswith("luci-i18n-")) | not)
                   or (.name | test("^luci-i18n-passwall-zh-cn([_-])"))
                 )
-              # sing-box and sing-box-tiny provide the same executable and
-              # cannot be installed together. Keep the full sing-box build.
-              | select(.name | test("^sing-box-tiny([_-])") | not)
+              # sing-box and sing-box-tiny are mutually exclusive. PassWall
+              # can use the tiny variant, so exclude only the full package.
+              | select(.name | test("^sing-box[_-][0-9]") | not)
               | [.name, .browser_download_url] | @tsv
             ' <<< "$release_json" |
             while IFS="$(printf '\t')" read -r asset_name asset_url; do
@@ -126,15 +126,16 @@ jobs:
 
           opkg update
 
-          # Defensive cleanup in case an upstream release contains both
-          # mutually exclusive sing-box package variants.
-          rm -f packages/sing-box-tiny_*.ipk packages/sing-box-tiny-*.ipk
+          # Defensive cleanup: retain sing-box-tiny and discard the mutually
+          # exclusive full sing-box package if upstream naming changes.
+          rm -f packages/sing-box_[0-9]*.ipk packages/sing-box-[0-9]*.ipk
 
-          # The device may already have sing-box-tiny installed. It conflicts
-          # with the full sing-box package selected by this installer.
-          if opkg status sing-box-tiny 2>/dev/null | grep -q '^Status:.* installed'; then
-            echo "Removing installed sing-box-tiny before installing sing-box"
-            opkg remove --force-depends sing-box-tiny
+          # Use list-installed instead of `opkg status`, whose behavior differs
+          # between opkg versions. Remove a pre-existing full sing-box package
+          # before installing the selected tiny variant.
+          if opkg list-installed | grep -q '^sing-box '; then
+            echo "Removing installed sing-box before installing sing-box-tiny"
+            opkg remove --force-depends sing-box
           fi
 
           # Recent mihomo packages manage /usr/bin/mihomo with opkg
