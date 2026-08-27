@@ -130,6 +130,13 @@ jobs:
           # mutually exclusive sing-box package variants.
           rm -f packages/sing-box-tiny_*.ipk packages/sing-box-tiny-*.ipk
 
+          # The device may already have sing-box-tiny installed. It conflicts
+          # with the full sing-box package selected by this installer.
+          if opkg status sing-box-tiny 2>/dev/null | grep -q '^Status:.* installed'; then
+            echo "Removing installed sing-box-tiny before installing sing-box"
+            opkg remove --force-depends sing-box-tiny
+          fi
+
           # Recent mihomo packages manage /usr/bin/mihomo with opkg
           # alternatives. Preserve an existing regular file before the
           # package creates its symlink.
