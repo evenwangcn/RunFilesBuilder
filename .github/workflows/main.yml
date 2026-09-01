@@ -7,7 +7,7 @@ on:
         description: OpenWrt / ImmortalWrt version
         required: true
         type: choice
-        default: "24.10.5"
+        default: "24.10"
         options:
           - "25.12"
           - "24.10"
@@ -45,18 +45,19 @@ jobs:
           passwall_tag="$(jq -er '.tag_name' <<<"$passwall_json")"
 
           # kenzok8 的 tag 格式类似：89-x86_64-24.10.5。
-          # 分页读取 Release，分别寻找两个架构的最新匹配项。
+          # 用户只选择 24.10 这类大版本；这里自动选择相应架构下
+          # 发布时间最新的 24.10.x Release。
           releases="$(gh api --paginate "repos/${KENZOK8_REPO}/releases?per_page=100" --slurp)"
           for arch in x86_64 aarch64_cortex-a53; do
-            tag="$(jq -er --arg suffix "-${arch}-${OPENWRT_VERSION}" \
-              '[.[][] | select(.draft == false and (.tag_name | endswith($suffix)))]
+            tag="$(jq -er --arg marker "-${arch}-${OPENWRT_VERSION}." \
+              '[.[][] | select(.draft == false and (.tag_name | contains($marker)))]
                | sort_by(.published_at) | reverse | .[0].tag_name' <<<"$releases")"
             printf 'KENZOK8_TAG_%s=%s\n' "${arch//-/_}" "$tag" >> "$GITHUB_ENV"
           done
 
           echo "PASSWALL_TAG=$passwall_tag" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=passwall-${passwall_tag}-openwrt-${OPENWRT_VERSION}" >> "$GITHUB_ENV"
-          if [[ "$OPENWRT_VERSION" == 25.12.* ]]; then
+          if [[ "$OPENWRT_VERSION" == "25.12" ]]; then
             echo "PACKAGE_FORMAT=apk" >> "$GITHUB_ENV"
           else
             echo "PACKAGE_FORMAT=ipk" >> "$GITHUB_ENV"
