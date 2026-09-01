@@ -9,6 +9,7 @@ on:
         type: choice
         default: "24.10.5"
         options:
+          - "25.12.0"
           - "24.10.5"
           - "23.05.5"
 
@@ -55,6 +56,11 @@ jobs:
 
           echo "PASSWALL_TAG=$passwall_tag" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=passwall-${passwall_tag}-openwrt-${OPENWRT_VERSION}" >> "$GITHUB_ENV"
+          if [[ "$OPENWRT_VERSION" == 25.12.* ]]; then
+            echo "PACKAGE_FORMAT=apk" >> "$GITHUB_ENV"
+          else
+            echo "PACKAGE_FORMAT=ipk" >> "$GITHUB_ENV"
+          fi
 
       - name: Clone makeself
         run: git clone --depth 1 https://github.com/megastep/makeself.git
@@ -66,14 +72,22 @@ jobs:
           set -euo pipefail
           mkdir -p downloads/main
 
-          # OpenWrt 23.05 和 24.10 共用上游的 23.05-24.10 IPK。
-          gh release download "$PASSWALL_TAG" \
-            --repo "$PASSWALL_REPO" \
-            --dir downloads/main \
-            --pattern '23.05-24.10_luci-app-passwall_*_all.ipk' \
-            --pattern '23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk'
+          if [[ "$PACKAGE_FORMAT" == apk ]]; then
+            gh release download "$PASSWALL_TAG" \
+              --repo "$PASSWALL_REPO" \
+              --dir downloads/main \
+              --pattern '25.12+_luci-app-passwall-*.apk' \
+              --pattern '25.12+_luci-i18n-passwall-zh-cn-*.apk'
+          else
+            # OpenWrt 23.05 和 24.10 共用上游的 23.05-24.10 IPK。
+            gh release download "$PASSWALL_TAG" \
+              --repo "$PASSWALL_REPO" \
+              --dir downloads/main \
+              --pattern '23.05-24.10_luci-app-passwall_*_all.ipk' \
+              --pattern '23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk'
+          fi
 
-          test "$(find downloads/main -maxdepth 1 -name '*.ipk' | wc -l)" -eq 2
+          test "$(find downloads/main -maxdepth 1 -name "*.${PACKAGE_FORMAT}" | wc -l)" -eq 2
 
       - name: Download dependencies from kenzok8
         env:
@@ -91,7 +105,8 @@ jobs:
             # PassWall 可使用的运行组件，避免把其他管理插件一起装进路由器。
             gh api "repos/${KENZOK8_REPO}/releases/tags/${tag}" --paginate \
               --jq '.assets[].browser_download_url' |
-              grep -E '/(brook|chinadns-ng|dns2socks|geoview|haproxy|hysteria|ipt2socks|microsocks|naiveproxy|shadowsocks-libev|shadowsocks-rust|shadowsocksr-libev|simple-obfs|sing-box|tcping|trojan-plus|tuic-client|v2ray-geoip|v2ray-geosite|v2ray-plugin|xray-core|xray-plugin|shadow-tls)[^/]*\.ipk$' |
+              grep -E "/(brook|chinadns-ng|dns2socks|geoview|haproxy|hysteria|ipt2socks|microsocks|naiveproxy|shadowsocks-libev|shadowsocks-rust|shadowsocksr-libev|simple-obfs|sing-box|tcping|trojan-plus|tuic-client|v2ray-geoip|v2ray-geosite|v2ray-plugin|xray-core|xray-plugin|shadow-tls)[^/]*\\.${PACKAGE_FORMAT}$" |
+              grep -Ev "/sing-box-tiny[^/]*\\.${PACKAGE_FORMAT}$" |
               while IFS= read -r url; do
                 curl --fail --location --retry 3 \
                   -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -99,7 +114,7 @@ jobs:
                   --output "$dest/$(basename "$url")" "$url"
               done
 
-            test -n "$(find "$dest" -maxdepth 1 -name '*.ipk' -print -quit)"
+            test -n "$(find "$dest" -maxdepth 1 -name "*.${PACKAGE_FORMAT}" -print -quit)"
           }
 
           download_dependencies x86_64 "$KENZOK8_TAG_x86_64"
@@ -111,22 +126,36 @@ jobs:
           for arch in x86_64 aarch64_cortex-a53; do
             package_dir="passwall_${arch}"
             mkdir -p "$package_dir/depends" "$package_dir/main"
-            cp downloads/depends/"$arch"/*.ipk "$package_dir/depends/"
-            cp downloads/main/*.ipk "$package_dir/main/"
+            cp downloads/depends/"$arch"/*."$PACKAGE_FORMAT" "$package_dir/depends/"
+            cp downloads/main/*."$PACKAGE_FORMAT" "$package_dir/main/"
+
+            # sing-box 和 sing-box-tiny 提供相同的二进制及 init 脚本，不能共存。
+            # PassWall 使用完整版 sing-box；这里再做一次防御性清理。
+            find "$package_dir/depends" -maxdepth 1 \
+              -type f -name "sing-box-tiny*.${PACKAGE_FORMAT}" -delete
+            test -n "$(find "$package_dir/depends" -maxdepth 1 \
+              -type f -name "sing-box*.${PACKAGE_FORMAT}" \
+              ! -name "sing-box-tiny*.${PACKAGE_FORMAT}" -print -quit)"
 
             cat > "$package_dir/install.sh" <<'INSTALL_SCRIPT'
           #!/bin/sh
           set -e
           cd "$(dirname "$0")"
 
-          opkg update
-          opkg install iptables-mod-tproxy iptables-mod-socket \
-            iptables-mod-iprange iptables-mod-conntrack-extra
-
-          # 先安装运行组件，再安装 LuCI 主包和中文包。
-          # 某些组件是可选后端；批量安装可让离线 run 包直接使用。
-          opkg install depends/*.ipk
-          opkg install main/*.ipk
+          if command -v apk >/dev/null 2>&1; then
+              apk update
+              apk add --allow-untrusted depends/*.apk
+              apk add --allow-untrusted main/*.apk
+          elif command -v opkg >/dev/null 2>&1; then
+              opkg update
+              opkg install iptables-mod-tproxy iptables-mod-socket \
+                iptables-mod-iprange iptables-mod-conntrack-extra
+              opkg install depends/*.ipk
+              opkg install main/*.ipk
+          else
+              echo "Error: neither apk nor opkg was found."
+              exit 1
+          fi
           /etc/init.d/rpcd restart 2>/dev/null || true
           /etc/init.d/uhttpd restart 2>/dev/null || true
           INSTALL_SCRIPT
